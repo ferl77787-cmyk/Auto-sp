@@ -18,20 +18,85 @@ import threading
 from queue import Queue
 import logging
 
+# Railway-specific imports
+try:
+    import subprocess
+    # Install browsers in background if needed
+    if os.environ.get('RAILWAY_ENVIRONMENT'):
+        os.system('playwright install chromium --with-deps')
+except:
+    pass
 
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
+# Set Railway-friendly logging
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
-request_queue = Queue(maxsize=100)
+request_queue = Queue(maxsize=50)  # Reduced queue size
 processing_lock = threading.Lock()
 
 DEVICE_FINGERPRINT = "noXc7Zv4NmOzRNIl3zmSernrLMFEo05J0lh73kdY46cUpMIuLjBQbCwQygBbMH4t4xfrCkwWutyony5DncDTRX0e50ULyy2GMgy2LUxAwaxczwLNJYzwLXqTe7GlMxqzCo7XgsfxKEWuy6hRjefIXYKVOJ23KBn6..."
 
 PROXY_CONFIG = None
+
+# Railway environment detection
+IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
+IS_LINUX = platform.system() == 'Linux'
+
+# Configure Playwright for Railway
+PLAYWRIGHT_BROWSERS_PATH = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/app/ms-playwright')
+
+def setup_playwright_browser():
+    """Setup Playwright with Railway optimizations"""
+    try:
+        # Set browser path
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = PLAYWRIGHT_BROWSERS_PATH
+        
+        # Browser arguments for memory optimization
+        browser_args = [
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--disable-setuid-sandbox',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-sync',
+            '--disable-default-apps',
+            '--disable-translate',
+            '--disable-background-networking',
+            '--disable-sync',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-features=TranslateUI',
+            '--disable-ipc-flooding-protection',
+            '--disable-hang-monitor',
+            '--disable-prompt-on-repost',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-update',
+            '--disable-databases',
+            '--disable-local-storage',
+            '--disable-session-storage',
+            '--disable-application-cache',
+            '--disable-cookie-encryption',
+            '--memory-pressure-off',
+            '--max_old_space_size=256',  # Limit memory
+            '--js-flags="--max-old-space-size=256"'
+        ]
+        
+        if IS_LINUX:
+            browser_args.extend(['--headless=new'])
+        
+        return browser_args
+    except Exception as e:
+        print(f"Browser setup error: {e}")
+        return ['--no-sandbox', '--disable-dev-shm-usage']
 
 def setup_proxy(proxy_string):
     if not proxy_string or proxy_string.strip() == "":
@@ -59,60 +124,82 @@ def setup_proxy(proxy_string):
         return None 
 
 def get_dynamic_session_token():
+    """Get session token with timeout and memory optimization"""
     try:
+        browser_args = setup_playwright_browser()
+        
         with sync_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
+            # Launch with minimal resources
             browser = p.chromium.launch(
-                headless=True, 
+                headless=True,
                 proxy=PROXY_CONFIG,
-                args=browser_args
+                args=browser_args,
+                timeout=20000
             )
+            
             page = browser.new_page()
+            
+            # Set minimal viewport
+            page.set_viewport_size({"width": 800, "height": 600})
+            
             page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
+            
             initial_url = "https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1"
-            page.goto(initial_url, timeout=30000)
-            page.wait_for_url("**/checkout/public*session_token*", timeout=25000)
+            page.goto(initial_url, timeout=25000)
+            page.wait_for_url("**/checkout/public*session_token*", timeout=20000)
             final_url = page.url
+            
+            # Clean up properly
+            page.close()
             browser.close()
-
+            
             session_token = parse_qs(urlparse(final_url).query).get("session_token", [None])[0]
             return (session_token, None) if session_token else (None, "Token not found in URL.")
+            
     except Exception as e:
         return None, f"Session token error: {str(e)[:100]}"
 
 def handle_redirect_and_get_result(redirect_url):
+    """Handle redirect with memory optimization"""
     try:
+        browser_args = setup_playwright_browser()
+        
         with sync_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
             browser = p.chromium.launch(
-                headless=True, 
+                headless=True,
                 proxy=PROXY_CONFIG,
-                args=browser_args
+                args=browser_args,
+                timeout=20000
             )
             page = browser.new_page()
+            page.set_viewport_size({"width": 800, "height": 600})
             page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
-            page.goto(redirect_url, timeout=45000, wait_until='networkidle')
+            page.goto(redirect_url, timeout=30000, wait_until='domcontentloaded')
 
             html_content = page.content()
             
             body_locator = page.locator("body")
-            body_locator.wait_for(timeout=10000)
+            body_locator.wait_for(timeout=8000)
             full_status_text = body_locator.inner_text()
 
+            # Clean up
+            page.close()
             browser.close()
 
             if 'razorpay_signature' in html_content:
                 return "payment successful"
             
             return " ".join(full_status_text.split())
+            
     except Exception as e:
         return f"Redirect error: {str(e)[:100]}"
 
 def extract_merchant_data_direct(site_url):
+    """Extract merchant data with memory optimization"""
     try:
         merchant_match = re.search(r'razorpay\.me/@([^/?]+)', site_url)
         if not merchant_match:
@@ -120,19 +207,22 @@ def extract_merchant_data_direct(site_url):
         
         merchant_handle = merchant_match.group(1)
         
+        browser_args = setup_playwright_browser()
+        
         with sync_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
             browser = p.chromium.launch(
-                headless=True, 
+                headless=True,
                 proxy=PROXY_CONFIG,
-                args=browser_args
+                args=browser_args,
+                timeout=20000
             )
             page = browser.new_page()
+            page.set_viewport_size({"width": 800, "height": 600})
             page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
             
-            page.goto(site_url, timeout=45000, wait_until='networkidle')
+            page.goto(site_url, timeout=30000, wait_until='domcontentloaded')
             
             keyless_header = None
             key_id = None
@@ -140,7 +230,7 @@ def extract_merchant_data_direct(site_url):
             payment_page_item_id = None
             
             try:
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)  # Reduced wait time
                 
                 data_from_page = page.evaluate("""
                     () => {
@@ -180,10 +270,12 @@ def extract_merchant_data_direct(site_url):
             except Exception as e:
                 pass
             
+            # Clean up
+            page.close()
             browser.close()
             
             if not all([keyless_header, key_id, payment_link_id, payment_page_item_id]):
-                
+                # Fallback data
                 fallback_data = {
                     'hotelparasinternationaldelhi': {
                         'key_id': 'rzp_live_hrgl3RDoNMvCOs',
@@ -211,7 +303,6 @@ def extract_merchant_data_direct(site_url):
                             payment_page_item_id = api_data.get('payment_page_items', [{}])[0].get('id')
                     except:
                         pass
-            
             
             if not all([keyless_header, key_id, payment_link_id, payment_page_item_id]):
                 missing = []
@@ -744,17 +835,31 @@ def process_card_request(request_data):
 if __name__ == "__main__":
     os_name = platform.system()
     
+    # Railway-specific setup
     if os_name == "Linux":
         os.environ['DISPLAY'] = ':99'
         
-    for i in range(min(4, os.cpu_count() or 1)):
+        # Install playwright browsers if not present
+        try:
+            import subprocess
+            subprocess.run(['playwright', 'install', 'chromium'], check=False)
+            subprocess.run(['playwright', 'install', 'deps'], check=False)
+        except:
+            pass
+    
+    # Reduced number of workers for Railway (memory optimization)
+    num_workers = min(2, os.cpu_count() or 1)  # Reduced from 4 to 2
+    for i in range(num_workers):
         worker = threading.Thread(target=process_request_worker, daemon=True)
         worker.start()
+    
+    # Get port from Railway environment
+    port = int(os.environ.get('PORT', 5000))
     
     try:
         app.run(
             host='0.0.0.0', 
-            port=5000, 
+            port=port, 
             debug=False,
             threaded=True,
             use_reloader=False
